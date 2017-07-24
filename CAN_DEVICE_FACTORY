@@ -1,0 +1,220 @@
+using BatteryDevice.BMS.Common;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace BatteryDevice.BMS.Communication
+{
+    public class CanDeviceFactory
+    {
+        private static readonly CanDeviceFactory m_instance = new CanDeviceFactory();
+
+        public static CanDeviceFactory Instance
+        {
+            get
+            {
+                return m_instance;
+            }
+        }
+
+        private ConcurrentDictionary<string, CanDevice> m_deviceCache;
+
+        private Socket m_server;
+
+        private bool m_isRunning;
+
+        private Thread m_receiveThread;
+
+        private Thread m_sendThread;
+
+        private CanDeviceAcceptedHandler m_canDeviceAcceptedEventHandler;
+
+        private const int RECEIVE_SIZE = 1024;
+
+        private const int LOCAL_PORT = 4060;
+
+        public event CanDeviceAcceptedHandler CanDeviceAccepted
+        {
+            add { m_canDeviceAcceptedEventHandler += value; }
+            remove { m_canDeviceAcceptedEventHandler -= value; }
+        }
+
+        private CanDeviceFactory()
+        {
+            m_isRunning = false;
+            m_deviceCache = new ConcurrentDictionary<string, CanDevice>();
+
+            // 屏蔽UDP的系统异常
+            byte[] inOptionValues = { Convert.ToByte(false) };
+            uint IOC_IN = 0x80000000;
+            uint IOC_VENDOR = 0x18000000;
+            uint SIO_UDP_CONNRESET = IOC_IN | IOC_VENDOR | 12;
+            m_server = new Socket(AddressFamily.InterNetwork,
+                SocketType.Dgram, ProtocolType.Udp);
+            m_server.IOControl((int)SIO_UDP_CONNRESET, inOptionValues, null);
+            m_server.Bind(new IPEndPoint(IPAddress.Any, LOCAL_PORT));
+            AddCanDevice();
+        }
+
+        private void AddCanDevice()
+        {
+            CanDevice canDevice = new CanDevice("192.168.0.101");
+            m_deviceCache.AddOrUpdate("192.168.0.101",
+                canDevice, (key, value) => value);
+
+            canDevice = new CanDevice("192.168.0.102");
+            m_deviceCache.AddOrUpdate("192.168.0.102",
+                canDevice, (key, value) => value);
+
+            canDevice = new CanDevice("192.168.0.103");
+            m_deviceCache.AddOrUpdate("192.168.0.103",
+                canDevice, (key, value) => value);
+
+            canDevice = new CanDevice("192.168.0.104");
+            m_deviceCache.AddOrUpdate("192.168.0.104",
+                canDevice, (key, value) => value);
+        }
+
+        private void ReceiveCanPackage(object state)
+        {
+            int receiveLength = 0;
+            byte[] data = new byte[RECEIVE_SIZE * RECEIVE_SIZE * 2];
+            EndPoint remotePoint = new IPEndPoint(IPAddress.Any, 4001);
+            while (m_isRunning)
+            {
+                try
+                {
+                    Array.Clear(data, 0, data.Length);
+                    receiveLength = m_server.ReceiveFrom(data, SocketFlags.None, ref remotePoint);
+                }
+                catch
+                {
+
+                }
+                //System.Diagnostics.Trace.WriteLine("BMS Receive Count: " + receiveLength.ToString() 
+                //    + " RemotePoint: " + ((IPEndPoint)remotePoint).Address.ToString());
+
+                if (receiveLength == 0 
+                    || receiveLength % CanData.PACKAGE_SIZE != 0)
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                CanDevice canDevice;
+                IPEndPoint ipRemotePoint = (IPEndPoint)remotePoint;
+                if (m_deviceCache.ContainsKey(ipRemotePoint.Address.ToString()))
+                {
+                    canDevice = m_deviceCache[ipRemotePoint.Address.ToString()];
+                }
+                else
+                {
+                    canDevice = new CanDevice(ipRemotePoint.Address.ToString());
+                    m_deviceCache.AddOrUpdate(ipRemotePoint.Address.ToString(),
+                        canDevice, (key, value) => value);
+
+                    if (m_canDeviceAcceptedEventHandler != null)
+                    {
+                        m_canDeviceAcceptedEventHandler(canDevice);
+                    }
+                }
+
+                canDevice.Receive(data, receiveLength);
+                Thread.Sleep(10);
+            }
+        }
+
+        private void SendCanPackage(object state)
+        {
+            int interval = 50;
+            while (m_isRunning)
+            {
+                foreach (KeyValuePair<string, CanDevice> pair in this.m_deviceCache)
+                {
+                    pair.Value.Send(m_server);
+                }
+
+                foreach (KeyValuePair<string, CanDevice> pair in this.m_deviceCache)
+                {
+                    pair.Value.LoopSend((uint)interval, m_server);
+                }
+                Thread.Sleep(interval);
+            }
+        }
+
+        public bool Start()
+        {
+            if (m_isRunning == false)
+            {
+                m_isRunning = true;
+                m_receiveThread = new Thread(ReceiveCanPackage);
+                m_receiveThread.Start(null);
+
+                m_sendThread = new Thread(SendCanPackage);
+                m_sendThread.Start(null);
+                return true;
+            }
+            else
+                return false;
+        }
+
+        public void Stop()
+        {
+            m_isRunning = false;
+            if (m_receiveThread != null)
+            {
+                m_receiveThread.Abort();
+            }
+
+            if (m_sendThread != null)
+            {
+                m_sendThread.Abort();
+            }
+            m_server.Close(500);
+        }
+
+        public List<CanDevice> GetAll()
+        {
+            List<CanDevice> canDeviceList = new List<CanDevice>();
+            foreach (KeyValuePair<string, CanDevice> keyValuePair in m_deviceCache)
+            {
+                canDeviceList.Add(keyValuePair.Value);
+            }
+            return canDeviceList;
+        }
+
+        public CanDevice GetDeviceByIpAddress(string ipAddress)
+        {
+            if (String.IsNullOrEmpty(ipAddress)) throw new ArgumentNullException("ipAddress");
+
+            if (m_deviceCache.ContainsKey(ipAddress))
+            {
+                return m_deviceCache[ipAddress];
+            }
+            else
+                return null;
+        }
+
+        public void SetBaudRate(int baudRate, CanDevice canDevice)
+        {
+            if (canDevice == null) throw new ArgumentNullException("canDevice");
+            if (baudRate <= 0) throw new ArgumentOutOfRangeException("baudRate");
+
+            canDevice.SetBaudRate(baudRate, m_server);
+        }
+
+        public void SendData(string ipAddress, byte[] data)
+        {
+            if (String.IsNullOrEmpty(ipAddress)) return;
+
+            CanDevice targetDevice = GetDeviceByIpAddress(ipAddress);
+            if (targetDevice != null)
+            {
+                targetDevice.SendDataOnce(data);
+            }
+        }
+    }
+}
