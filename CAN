@@ -1,0 +1,350 @@
+using BatteryDevice.BMS.Common;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
+
+namespace BatteryDevice.BMS.Communication
+{
+    public class CanDevice
+    {
+        private CanDataChangedHandler m_canDataChangedEventHandler;
+
+        private MethodInfo m_canDataPreProcessEventHandler;
+
+        private object m_canDataPreProcessLocker = new object();
+
+        private ConcurrentDictionary<uint, CanData> m_dataCache;
+
+        private ConcurrentQueue<byte[]> m_sendQueue;
+
+        private uint m_sendInterval;
+
+        private BMSInfo.DataSendType m_dataSendType;
+
+        private string m_targetDeviceIp;
+
+        private uint m_sendCount;
+
+        private object m_sendLocker;
+
+        private object[] m_dataParam = new object[3];
+
+        private List<Tuple<uint, byte[]>> m_newDataReturn = new List<Tuple<uint, byte[]>>();
+
+        private Socket m_sendSocket;
+
+        public string IpAddress { get; private set; }
+         
+        public EndPoint RemotePoint { get; private set; }
+
+        public Socket SendSocket { get { return m_sendSocket; } }
+
+        public event CanDataChangedHandler DataChanged
+        {
+            add { m_canDataChangedEventHandler += value; }
+            remove { m_canDataChangedEventHandler -= value; }
+        }
+
+        public MethodInfo DataPreProcess
+        {
+            set 
+            {
+                lock (m_canDataPreProcessLocker)
+                {
+                    m_canDataPreProcessEventHandler = value;
+                }
+            }
+        }
+
+        /*public event CanDataPreProcessHandler DataPreProcess
+        {
+            add { m_canDataPreProcessEventHandler += value; }
+            remove { m_canDataPreProcessEventHandler -= value; }
+        }*/
+
+        private ConcurrentQueue<byte[]> m_sendDataList = new ConcurrentQueue<byte[]>();
+
+        public CanDevice(string ipAddress)
+        {
+            this.IpAddress = ipAddress;
+            this.RemotePoint = new IPEndPoint(IPAddress.Parse(this.IpAddress), 4001/*8001*/);
+            this.m_dataCache = new ConcurrentDictionary<uint, CanData>();
+            this.m_sendQueue = new ConcurrentQueue<byte[]>();
+
+            this.m_sendDataList = new ConcurrentQueue<byte[]>();
+
+            /*this.m_sendSocket = new Socket(AddressFamily.InterNetwork,
+                SocketType.Dgram, ProtocolType.Udp);
+            this.m_sendSocket.Bind(new IPEndPoint(IPAddress.Any, 4060));*/
+            this.m_sendInterval = 50;
+            this.m_sendCount = 0;
+            this.m_sendLocker = new object();
+        }
+
+        ~CanDevice()
+        {
+            if (this.m_sendSocket != null)
+            {
+                this.m_sendSocket.Close();
+                this.m_sendSocket = null;
+            }
+        }
+
+        public void Receive(byte[] data, int length)
+        {
+            long updateTime = DateTime.Now.Ticks;
+            for (int i = 0, count = length / CanData.PACKAGE_SIZE; i < count; i++)
+            {
+                uint id = (uint)(data[i * CanData.PACKAGE_SIZE + 1] << 24 |
+                    data[i * CanData.PACKAGE_SIZE + 2] << 16 |
+                    data[i * CanData.PACKAGE_SIZE + 3] << 8 |
+                    data[i * CanData.PACKAGE_SIZE + 4]);
+
+                //System.Diagnostics.Trace.WriteLine(" id: " + id.ToString("X"));
+
+                byte[] tempData = new byte[CanData.DATA_SIZE];
+                Array.Copy(data, i * CanData.PACKAGE_SIZE + 1 + sizeof(uint),
+                    tempData, 0, tempData.Length);
+
+                //System.Diagnostics.Stopwatch watch = new System.Diagnostics.Stopwatch();
+                //watch.Restart();
+                lock (m_canDataPreProcessLocker)
+                {
+                    if (m_canDataPreProcessEventHandler != null)
+                    {
+                        m_dataParam[0] = id;
+                        m_dataParam[1] = tempData;
+                        m_dataParam[2] = m_newDataReturn;
+                        m_canDataPreProcessEventHandler.Invoke(null, m_dataParam);
+
+                        id = (uint)m_dataParam[0];
+                    }
+                }
+
+                if (id == 0)
+                {
+                    continue;
+                }
+                //watch.Stop();
+                //System.Diagnostics.Trace.WriteLine("Time: " + watch.ElapsedMilliseconds.ToString());
+
+                CanData canData;
+                if (m_dataCache.ContainsKey(id))
+                {
+                    canData = m_dataCache[id];
+                }
+                else
+                {
+                    canData = new CanData();
+                    canData.Id = id;
+                    m_dataCache.AddOrUpdate(canData.Id, canData, (key, value) => value);
+                }
+                canData.SetData(tempData, updateTime);
+
+                foreach (Tuple<uint, byte[]> newData in m_newDataReturn)
+                {
+                    if (m_dataCache.ContainsKey(newData.Item1))
+                    {
+                        canData = m_dataCache[newData.Item1];
+                    }
+                    else
+                    {
+                        canData = new CanData();
+                        canData.Id = newData.Item1;
+                        m_dataCache.AddOrUpdate(canData.Id, canData, (key, value) => value);
+                    }
+                    canData.SetData(newData.Item2, updateTime);
+                }
+                m_newDataReturn.Clear();
+
+                if (m_canDataChangedEventHandler != null)
+                {
+                    m_canDataChangedEventHandler(canData);
+                }
+            }
+        }
+
+        public void Send(byte[] data)
+        {
+            if (data != null)
+            {
+                this.m_sendQueue.Enqueue(data);
+            }
+        }
+
+        public void LoadBMSSendData(string sendData, int sendInterval)
+        {
+            LoadBMSSendData(sendData, sendInterval, BMSInfo.DataSendType.SameWay, String.Empty);
+        }
+
+        public void LoadBMSSendData(string sendData, int sendInterval,
+            BMSInfo.DataSendType dataSendType, string targetDeviceIp)
+        {
+            lock (this.m_sendLocker)
+            {
+                this.m_dataSendType = dataSendType;
+                this.m_targetDeviceIp = targetDeviceIp;
+                this.m_sendInterval = 50;
+                byte[] temp;
+                while (!this.m_sendQueue.IsEmpty)
+                {
+                    this.m_sendQueue.TryDequeue(out temp);
+                }
+
+                this.m_sendInterval = sendInterval > 50 ? (uint)sendInterval : 50;
+                foreach (string data in sendData.Split('\r'))
+                {
+                    string text = data.Trim().Replace(" ", String.Empty);
+                    if (!String.IsNullOrEmpty(text))
+                    {
+                        byte[] byteData = new byte[text.Length / 2];
+                        for (int i = 0, j = 0; i < text.Length && j < byteData.Length; i = i + 2, j++)
+                        {
+                            byteData[j] = Convert.ToByte(text.Substring(i, 2), 16);
+                        }
+                        this.m_sendQueue.Enqueue(byteData);
+                    }
+                }
+            }
+        }
+
+        public List<CanData> GetAll()
+        {
+            List<CanData> canDatas = new List<CanData>();
+            foreach (KeyValuePair<uint, CanData> keyValuePair in m_dataCache)
+                canDatas.Add(keyValuePair.Value);
+            return canDatas;
+        }
+
+        public CanData GetDataById(uint id)
+        {
+            if (m_dataCache.ContainsKey(id))
+                return m_dataCache[id];
+            else
+                return null;
+        }
+
+        public override string ToString()
+        {
+            return this.IpAddress;
+        }
+
+        //internal void Send(Socket socket)
+        //{
+        //    if (socket == null) throw new ArgumentNullException("socket");
+
+        //    //if (this.m_sendQueue.Count > 0)  //只发一个
+        //    while (!this.m_sendQueue.IsEmpty /*this.m_sendQueue.Count > 0*/) //全部发完
+        //    {
+        //        byte[] data = null;
+        //        if (this.m_sendQueue.TryDequeue(out data))
+        //        {
+        //            int len = this.m_sendSocket.SendTo(data, SocketFlags.None, this.RemotePoint);
+        //            //System.Diagnostics.Trace.WriteLine("BMS Send Count: " + len.ToString()
+        //            //    + " RemotePoint: " + ((IPEndPoint)RemotePoint).Address.ToString());
+        //            System.Threading.Thread.Sleep(5);
+        //        }
+        //    }
+        //}
+
+        internal void LoopSend(uint interval, Socket socket)
+        {
+            if (socket == null) return;
+
+            this.m_sendCount += interval;
+            if (this.m_sendCount >= this.m_sendInterval)
+            {
+                this.m_sendCount = 0;
+                lock (this.m_sendLocker)
+                {
+                    int totalCount = this.m_sendQueue.Count;
+                    for (int time = 0; time < totalCount; time++ )
+                    {
+                        byte[] data = null;
+                        if (this.m_sendQueue.TryDequeue(out data))
+                        {
+                            switch (this.m_dataSendType)
+                            {
+                                case BMSInfo.DataSendType.SameWay:
+                                    {
+                                        int len = socket.SendTo(data, SocketFlags.None, this.RemotePoint);
+                                        //System.Diagnostics.Trace.WriteLine("BMS Send Count: " + len.ToString()
+                                        //    + " RemotePoint: " + ((IPEndPoint)RemotePoint).Address.ToString());
+                                        break;
+                                    }
+                                case BMSInfo.DataSendType.OtherWay:
+                                    {
+                                        CanDeviceFactory.Instance.SendData(this.m_targetDeviceIp, data);
+                                        break;
+                                    }
+                            }
+                            
+                            System.Threading.Thread.Sleep(2);
+                            this.m_sendQueue.Enqueue(data);
+                        }
+                    }
+                }
+            }
+        }
+
+        internal void Send(Socket socket)
+        {
+            if (socket == null) return;
+
+            byte[] data;
+            lock (this.m_sendLocker)
+            {
+                if (this.m_sendDataList.TryDequeue(out data))
+                {
+                    socket.SendTo(data, SocketFlags.None, this.RemotePoint);
+                    //System.Diagnostics.Trace.WriteLine("BMS Send Count: " + len.ToString()
+                    //    + " RemotePoint: " + ((IPEndPoint)RemotePoint).Address.ToString());
+                    System.Threading.Thread.Sleep(2);
+                }
+            }
+        }
+
+        internal void SetBaudRate(int baudRate, Socket socket)
+        {
+            if (baudRate <= 0) throw new ArgumentOutOfRangeException("baudRate");
+
+            if (socket == null)
+            {
+                return;
+            }
+
+            Command.SetBaudRate setBaudRateCmd = new Command.SetBaudRate();
+            setBaudRateCmd.BoxNumber = 0xff;
+            setBaudRateCmd.BaudRate = (ushort)baudRate;
+
+            this.m_sendDataList.Enqueue(setBaudRateCmd.Serialization());
+        }
+
+        internal void SendDataOnce(byte[] data)
+        {
+            lock (this.m_sendLocker)
+            {
+                this.m_sendDataList.Enqueue(data);
+            }
+        }
+
+        public void ResetTendencyAdjust()
+        {
+            /*foreach (KeyValuePair<uint, CanData> pair in this.m_dataCache)
+            {
+                pair.Value.ResetTendencyAdjust();
+            }*/
+        }
+
+        public void ClearDataCache()
+        {
+            if (m_dataCache != null)
+            {
+                m_dataCache.Clear();
+            }
+        }
+    }
+}
